@@ -17,6 +17,7 @@ import (
 const port = "8888"
 const acceptedTokenPattern = `^[0-9]{9}`
 const file = "numbers.log"
+const workerCount = 5
 
 var saveMap sync.Map
 var lock sync.Mutex
@@ -24,6 +25,10 @@ var fileWriter *bufio.Writer
 var accepteds int64
 var acceptedTotal int64
 var duplicates int64
+
+var running = true
+var doneQueue = make(chan string)
+var workerQueue = make(chan net.Conn)
 
 func main() {
 	setupExitHandler()
@@ -35,8 +40,7 @@ func main() {
 
 	defer saveFile.Close()
 
-	queue := make(chan net.Conn)
-	defer close(queue)
+	defer close(workerQueue)
 
 	// start the reporter
 	go func() {
@@ -50,8 +54,8 @@ func main() {
 		}
 	}()
 
-	for i := 0; i < 5; i++ {
-		go acceptCode(queue)
+	for i := 0; i < workerCount; i++ {
+		go acceptCode(workerQueue, fmt.Sprintf("Routine-%v", i))
 	}
 
 	ln, err := net.Listen("tcp", ":"+port)
@@ -64,7 +68,7 @@ func main() {
 			conn.Close()
 		} else {
 			select {
-			case queue <- conn:
+			case workerQueue <- conn:
 				fmt.Println("accepted")
 				// ok = true
 			default:
@@ -74,9 +78,9 @@ func main() {
 	}
 }
 
-func acceptCode(queue chan net.Conn) {
+func acceptCode(queue chan net.Conn, name string) {
 	validRegEx := regexp.MustCompile(acceptedTokenPattern)
-	for {
+	for running {
 		conn, ok := <-queue
 		if !ok {
 			fmt.Println("Queue is closed, done")
@@ -84,7 +88,7 @@ func acceptCode(queue chan net.Conn) {
 		}
 
 		reader := bufio.NewScanner(conn)
-		for reader.Scan() {
+		for reader.Scan() && running {
 			tok := reader.Text()
 			if err := reader.Err(); err != nil {
 				fmt.Printf("Client stopped [%v] : %v\n", tok, err)
@@ -101,6 +105,8 @@ func acceptCode(queue chan net.Conn) {
 			}
 		}
 	}
+
+	doneQueue <- name
 }
 
 func save(token string) {
@@ -118,7 +124,6 @@ func save(token string) {
 		if _, err := fileWriter.Write([]byte(token + "\n")); err != nil {
 			log.Fatal(err)
 		}
-		fileWriter.Flush()
 	}
 }
 
@@ -127,9 +132,26 @@ func setupExitHandler() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		fmt.Println("\n- Exiting")
-		os.Exit(1)
+		exit()
 	}()
+}
+
+func exit() {
+	running = false
+	close(workerQueue)
+
+	routinesDone := 0
+	for routinesDone < workerCount {
+		select {
+		case routineName := <-doneQueue:
+			routinesDone++
+			fmt.Println("Routine done: " + routineName)
+		}
+	}
+
+	fileWriter.Flush()
+	fmt.Printf("\n- Exiting\n")
+	os.Exit(1)
 }
 
 func check(err error, message string) {

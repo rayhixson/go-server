@@ -1,5 +1,7 @@
-cat bestnums.txt | telnet localhost 8888  &
-cat bestnums2.txt | telnet localhost 8888  &
-cat bestnums3.txt | telnet localhost 8888  &
-cat bestnums4.txt | telnet localhost 8888  &
-cat bestnums5.txt | telnet localhost 8888  &
+cat nums.txt | nc localhost 8888  &
+cat nums2.txt | nc localhost 8888  &
+cat nums3.txt | nc localhost 8888  &
+cat nums4.txt | nc localhost 8888  &
+cat nums5.txt | nc localhost 8888  &
+cat nums5.txt | nc localhost 8888  &
+cat nums5.txt | nc localhost 8888  &
