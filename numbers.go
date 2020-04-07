@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -20,8 +21,8 @@ const file = "numbers.log"
 const workerCount = 5
 
 var saveMap sync.Map
+var numbersFileWriter *bufio.Writer
 var lock sync.Mutex
-var fileWriter *bufio.Writer
 var accepteds int64
 var acceptedTotal int64
 var duplicates int64
@@ -34,9 +35,9 @@ func main() {
 	setupExitHandler()
 
 	saveFile, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	check(err, "File opened for save")
+	check(err, "File opened for save: "+file)
 	saveFile.Truncate(0)
-	fileWriter = bufio.NewWriter(saveFile)
+	numbersFileWriter = bufio.NewWriter(saveFile)
 
 	defer saveFile.Close()
 
@@ -79,6 +80,37 @@ func main() {
 }
 
 func acceptCode(queue chan net.Conn, name string) {
+	myFile := file + "." + name + ".tmp"
+	saveFile, err := os.OpenFile(myFile, os.O_CREATE|os.O_RDWR, 0644)
+	check(err, "File opened for save: "+myFile)
+	saveFile.Truncate(0)
+	fileWriter := bufio.NewWriter(saveFile)
+
+	defer func() {
+		// write my file to the final numbers file
+		fileWriter.Flush()
+		_, err = saveFile.Seek(0, 0)
+		if err != nil {
+			log.Println("Failed to seek to beginning of this routines file for saving:", myFile, err)
+		} else {
+			lock.Lock()
+			_, err := io.Copy(numbersFileWriter, saveFile)
+			if err != nil {
+				log.Println("Failed to copy contents to final file: %v", err)
+			}
+			numbersFileWriter.Flush()
+			lock.Unlock()
+
+			saveFile.Close()
+			err = os.Remove(myFile)
+			if err != nil {
+				log.Println("Failed to remove temp file but did save it: ", err)
+			}
+		}
+
+		doneQueue <- name
+	}()
+
 	validRegEx := regexp.MustCompile(acceptedTokenPattern)
 	for running {
 		conn, ok := <-queue
@@ -97,7 +129,7 @@ func acceptCode(queue chan net.Conn, name string) {
 			}
 
 			if validRegEx.MatchString(tok) {
-				save(tok)
+				save(tok, fileWriter)
 			} else {
 				fmt.Printf("Rejected not a num: [%v]\n", tok)
 				conn.Close()
@@ -105,11 +137,9 @@ func acceptCode(queue chan net.Conn, name string) {
 			}
 		}
 	}
-
-	doneQueue <- name
 }
 
-func save(token string) {
+func save(token string, fileWriter io.Writer) {
 	_, exists := saveMap.LoadOrStore(token, nil)
 	if exists {
 		//fmt.Println("Duplicate:", token)
@@ -118,8 +148,6 @@ func save(token string) {
 		//fmt.Printf("Accepted: %v\n", token)
 		atomic.AddInt64(&accepteds, 1)
 		// and append to file
-		lock.Lock()
-		defer lock.Unlock()
 
 		if _, err := fileWriter.Write([]byte(token + "\n")); err != nil {
 			log.Fatal(err)
@@ -149,7 +177,8 @@ func exit() {
 		}
 	}
 
-	fileWriter.Flush()
+	// grab all files and write to one
+	numbersFileWriter.Flush()
 	fmt.Printf("\n- Exiting\n")
 	os.Exit(1)
 }
