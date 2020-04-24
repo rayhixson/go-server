@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -17,26 +18,30 @@ import (
 const port = "8888"
 const acceptedTokenPattern = `^[0-9]{9}`
 const file = "numbers.log"
+const workerCount = 5
 
 var saveMap sync.Map
+var numbersFileWriter *bufio.Writer
 var lock sync.Mutex
-var fileWriter *bufio.Writer
 var accepteds int64
 var acceptedTotal int64
 var duplicates int64
+
+var running = true
+var doneQueue = make(chan string)
+var workerQueue = make(chan net.Conn)
 
 func main() {
 	setupExitHandler()
 
 	saveFile, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	check(err, "File opened for save")
+	check(err, "File opened for save: "+file)
 	saveFile.Truncate(0)
-	fileWriter = bufio.NewWriter(saveFile)
+	numbersFileWriter = bufio.NewWriter(saveFile)
 
 	defer saveFile.Close()
 
-	queue := make(chan net.Conn)
-	defer close(queue)
+	defer close(workerQueue)
 
 	// start the reporter
 	go func() {
@@ -50,8 +55,8 @@ func main() {
 		}
 	}()
 
-	for i := 0; i < 5; i++ {
-		go acceptCode(queue)
+	for i := 0; i < workerCount; i++ {
+		go acceptCode(workerQueue, fmt.Sprintf("Routine-%v", i))
 	}
 
 	ln, err := net.Listen("tcp", ":"+port)
@@ -64,7 +69,7 @@ func main() {
 			conn.Close()
 		} else {
 			select {
-			case queue <- conn:
+			case workerQueue <- conn:
 				fmt.Println("accepted")
 				// ok = true
 			default:
@@ -74,9 +79,40 @@ func main() {
 	}
 }
 
-func acceptCode(queue chan net.Conn) {
+func acceptCode(queue chan net.Conn, name string) {
+	myFile := file + "." + name + ".tmp"
+	saveFile, err := os.OpenFile(myFile, os.O_CREATE|os.O_RDWR, 0644)
+	check(err, "File opened for save: "+myFile)
+	saveFile.Truncate(0)
+	fileWriter := bufio.NewWriter(saveFile)
+
+	defer func() {
+		// write my file to the final numbers file
+		fileWriter.Flush()
+		_, err = saveFile.Seek(0, 0)
+		if err != nil {
+			log.Println("Failed to seek to beginning of this routines file for saving:", myFile, err)
+		} else {
+			lock.Lock()
+			_, err := io.Copy(numbersFileWriter, saveFile)
+			if err != nil {
+				log.Println("Failed to copy contents to final file: %v", err)
+			}
+			numbersFileWriter.Flush()
+			lock.Unlock()
+
+			saveFile.Close()
+			err = os.Remove(myFile)
+			if err != nil {
+				log.Println("Failed to remove temp file but did save it: ", err)
+			}
+		}
+
+		doneQueue <- name
+	}()
+
 	validRegEx := regexp.MustCompile(acceptedTokenPattern)
-	for {
+	for running {
 		conn, ok := <-queue
 		if !ok {
 			fmt.Println("Queue is closed, done")
@@ -84,7 +120,7 @@ func acceptCode(queue chan net.Conn) {
 		}
 
 		reader := bufio.NewScanner(conn)
-		for reader.Scan() {
+		for reader.Scan() && running {
 			tok := reader.Text()
 			if err := reader.Err(); err != nil {
 				fmt.Printf("Client stopped [%v] : %v\n", tok, err)
@@ -93,7 +129,7 @@ func acceptCode(queue chan net.Conn) {
 			}
 
 			if validRegEx.MatchString(tok) {
-				save(tok)
+				save(tok, fileWriter)
 			} else {
 				fmt.Printf("Rejected not a num: [%v]\n", tok)
 				conn.Close()
@@ -103,7 +139,7 @@ func acceptCode(queue chan net.Conn) {
 	}
 }
 
-func save(token string) {
+func save(token string, fileWriter io.Writer) {
 	_, exists := saveMap.LoadOrStore(token, nil)
 	if exists {
 		//fmt.Println("Duplicate:", token)
@@ -112,13 +148,10 @@ func save(token string) {
 		//fmt.Printf("Accepted: %v\n", token)
 		atomic.AddInt64(&accepteds, 1)
 		// and append to file
-		lock.Lock()
-		defer lock.Unlock()
 
 		if _, err := fileWriter.Write([]byte(token + "\n")); err != nil {
 			log.Fatal(err)
 		}
-		fileWriter.Flush()
 	}
 }
 
@@ -127,9 +160,27 @@ func setupExitHandler() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		fmt.Println("\n- Exiting")
-		os.Exit(1)
+		exit()
 	}()
+}
+
+func exit() {
+	running = false
+	close(workerQueue)
+
+	routinesDone := 0
+	for routinesDone < workerCount {
+		select {
+		case routineName := <-doneQueue:
+			routinesDone++
+			fmt.Println("Routine done: " + routineName)
+		}
+	}
+
+	// grab all files and write to one
+	numbersFileWriter.Flush()
+	fmt.Printf("\n- Exiting\n")
+	os.Exit(1)
 }
 
 func check(err error, message string) {
