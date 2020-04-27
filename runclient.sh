@@ -1,5 +1,11 @@
-cat bestnums.txt | telnet localhost 8888  &
-cat bestnums2.txt | telnet localhost 8888  &
-cat bestnums3.txt | telnet localhost 8888  &
-cat bestnums4.txt | telnet localhost 8888  &
-cat bestnums5.txt | telnet localhost 8888  &
+#!/bin/bash
+
+if [ "$1" == "" ]; then
+    echo "how many clients?"
+    exit 1
+fi
+
+for i in `seq 1 $1`; do
+    sleep 1
+    go run gennums.go | nc localhost 8888 &
+done
