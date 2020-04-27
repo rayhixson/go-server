@@ -44,9 +44,6 @@ func main() {
 
 	saveFile.Truncate(0)
 
-	defer saveFile.Close()
-	defer close(workerQueue)
-
 	// start the reporter
 	go func() {
 		for {
@@ -167,6 +164,10 @@ func exit() {
 
 	// terminate the writer AFTER the handlers are done reading their last token
 	writerQueue <- terminateString
+
+	saveFile.Close()
+	close(workerQueue)
+	close(writerQueue)
 
 	os.Exit(1)
 }
