@@ -35,7 +35,9 @@ func main() {
 	setupExitHandler()
 
 	saveFile, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	check(err, "File opened for save: "+file)
+	if err != nil {
+		log.Panic("Failed to open", file, err)
+	}
 	saveFile.Truncate(0)
 	numbersFileWriter = bufio.NewWriter(saveFile)
 
@@ -60,7 +62,10 @@ func main() {
 	}
 
 	ln, err := net.Listen("tcp", ":"+port)
-	check(err, "Listening on port "+port+"...")
+	if err != nil {
+		log.Panic(err)
+	}
+	fmt.Printf("Listening on port %v...\n", port)
 
 	for {
 		conn, err := ln.Accept()
@@ -82,13 +87,15 @@ func main() {
 func acceptCode(queue chan net.Conn, name string) {
 	myFile := file + "." + name + ".tmp"
 	saveFile, err := os.OpenFile(myFile, os.O_CREATE|os.O_RDWR, 0644)
-	check(err, "File opened for save: "+myFile)
+	if err != nil {
+		log.Panicf("Failed to open file for saving: %v -> %v\n", myFile, err)
+	}
 	saveFile.Truncate(0)
-	fileWriter := bufio.NewWriter(saveFile)
+	//fileWriter := bufio.NewWriter(saveFile)
 
 	defer func() {
 		// write my file to the final numbers file
-		fileWriter.Flush()
+		//fileWriter.Flush()
 		_, err = saveFile.Seek(0, 0)
 		if err != nil {
 			log.Println("Failed to seek to beginning of this routines file for saving:", myFile, err)
@@ -129,7 +136,8 @@ func acceptCode(queue chan net.Conn, name string) {
 			}
 
 			if validRegEx.MatchString(tok) {
-				save(tok, fileWriter)
+				//save(tok, fileWriter)
+				save(tok, saveFile)
 			} else {
 				fmt.Printf("Rejected not a num: [%v]\n", tok)
 				conn.Close()
@@ -139,15 +147,12 @@ func acceptCode(queue chan net.Conn, name string) {
 	}
 }
 
-func save(token string, fileWriter io.Writer) {
+func save(token string, fileWriter *os.File) {
 	_, exists := saveMap.LoadOrStore(token, nil)
 	if exists {
-		//fmt.Println("Duplicate:", token)
 		atomic.AddInt64(&duplicates, 1)
 	} else {
-		//fmt.Printf("Accepted: %v\n", token)
 		atomic.AddInt64(&accepteds, 1)
-		// and append to file
 
 		if _, err := fileWriter.Write([]byte(token + "\n")); err != nil {
 			log.Fatal(err)
@@ -181,11 +186,4 @@ func exit() {
 	numbersFileWriter.Flush()
 	fmt.Printf("\n- Exiting\n")
 	os.Exit(1)
-}
-
-func check(err error, message string) {
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(message)
 }
