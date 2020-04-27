@@ -16,7 +16,7 @@ import (
 
 const port = "8888"
 const terminateString = "terminate"
-const acceptedTokenPattern = `^[0-9]{9}$`
+const acceptedTokenPattern = `^\d{9}$`
 const fileName = "numbers.log"
 const workerCount = 5
 
@@ -133,6 +133,7 @@ func save(token string) {
 		if _, err := numbersFileWriter.Write([]byte(token + "\n")); err != nil {
 			log.Fatalf("Failed to save [%v] -> %v", token, err)
 		}
+		numbersFileWriter.Flush()
 	}
 }
 
