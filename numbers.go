@@ -21,30 +21,31 @@ const fileName = "numbers.log"
 const workerCount = 5
 
 var saveMap sync.Map
-var numbersFileWriter *bufio.Writer
+var saveFile *os.File
 var accepteds int64
 var acceptedTotal int64
 var duplicates int64
-var lock sync.Mutex
-
+var waitGroup sync.WaitGroup
 var running = true
 
 type WorkerFunc func(net.Conn)
 
 var workerQueue = make(chan WorkerFunc, workerCount)
+var writerQueue = make(chan string)
 
 func main() {
 	setupExitHandler()
 
-	saveFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	var err error
+	saveFile, err = os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		panic(err)
 	}
 
 	saveFile.Truncate(0)
-	numbersFileWriter = bufio.NewWriter(saveFile)
 
 	defer saveFile.Close()
+	defer close(workerQueue)
 
 	// start the reporter
 	go func() {
@@ -55,6 +56,20 @@ func main() {
 			atomic.AddInt64(&acceptedTotal, oldAccepteds)
 			fmt.Printf("Received %v unique numbers, %v duplicates. Unique total: %v\n",
 				oldAccepteds, oldDups, acceptedTotal)
+		}
+	}()
+
+	// do all file writes from one routing
+	go func() {
+		for {
+			token := <-writerQueue
+			// write until we get the terminate signal
+			if token == terminateString {
+				break
+			}
+			if _, err := saveFile.Write([]byte(token + "\n")); err != nil {
+				log.Fatalf("Failed to save [%v] -> %v", token, err)
+			}
 		}
 	}()
 
@@ -77,6 +92,7 @@ func main() {
 			select {
 			case worker := <-workerQueue:
 				fmt.Println("accepted")
+				waitGroup.Add(1)
 				go worker(conn)
 			default:
 				fmt.Println("Rejected connection, queue full")
@@ -86,6 +102,8 @@ func main() {
 }
 
 func acceptCode(conn net.Conn) {
+	defer waitGroup.Done()
+
 	validRegEx := regexp.MustCompile(acceptedTokenPattern)
 	reader := bufio.NewScanner(conn)
 	for reader.Scan() && running {
@@ -97,7 +115,7 @@ func acceptCode(conn net.Conn) {
 		}
 
 		if tok == terminateString {
-			exit()
+			defer exit()
 			conn.Close()
 			break
 		}
@@ -128,12 +146,7 @@ func save(token string) {
 		atomic.AddInt64(&accepteds, 1)
 
 		// and append to file
-		lock.Lock()
-		defer lock.Unlock()
-		if _, err := numbersFileWriter.Write([]byte(token + "\n")); err != nil {
-			log.Fatalf("Failed to save [%v] -> %v", token, err)
-		}
-		numbersFileWriter.Flush()
+		writerQueue <- token
 	}
 }
 
@@ -147,18 +160,13 @@ func setupExitHandler() {
 }
 
 func exit() {
+	// signal all threads and main loop to end
 	running = false
-	close(workerQueue)
 
-	doneCount := 0
-	for doneCount < workerCount {
-		select {
-		case <-workerQueue:
-			doneCount++
-			fmt.Println("Routine done.")
-		}
-	}
+	waitGroup.Wait()
 
-	numbersFileWriter.Flush()
+	// terminate the writer AFTER the handlers are done reading their last token
+	writerQueue <- terminateString
+
 	os.Exit(1)
 }
