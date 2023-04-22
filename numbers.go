@@ -23,12 +23,11 @@ const acceptedTokenPattern = `^\d{9}$`
 const fileName = "numbers.log"
 const workerCount = 5
 
-// var saveMap sync.Map
 var saveMap map[uint32]bool
 var mutex sync.Mutex
-var accepteds int64
-var acceptedTotal int64
-var duplicates int64
+var accepteds atomic.Int64
+var acceptedTotal atomic.Int64
+var duplicates atomic.Int64
 var waitGroup sync.WaitGroup
 var running = true
 var logger *bufio.Writer
@@ -38,8 +37,6 @@ type WorkerFunc func(net.Conn)
 var workerQueue = make(chan WorkerFunc, workerCount)
 var writerQueue = make(chan string)
 
-var m0, m1 runtime.MemStats
-
 func memUsage(m1, m2 *runtime.MemStats) {
 	fmt.Println("Alloc:", m2.Alloc-m1.Alloc,
 		"TotalAlloc:", m2.TotalAlloc-m1.TotalAlloc,
@@ -47,9 +44,8 @@ func memUsage(m1, m2 *runtime.MemStats) {
 }
 
 func main() {
-	runtime.ReadMemStats(&m0)
-	saveMap = make(map[uint32]bool, 100000000)
 	setupExitHandler()
+	saveMap = make(map[uint32]bool, 100000000)
 
 	saveFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -63,13 +59,11 @@ func main() {
 	go func() {
 		for {
 			time.Sleep(10 * time.Second)
-			oldDups := atomic.SwapInt64(&duplicates, 0)
-			oldAccepteds := atomic.SwapInt64(&accepteds, 0)
-			atomic.AddInt64(&acceptedTotal, oldAccepteds)
+			oldDups := duplicates.Swap(0)
+			oldAccepteds := accepteds.Swap(0)
+			newTotal := acceptedTotal.Add(oldAccepteds)
 			fmt.Printf("Received %v unique numbers, %v duplicates. Unique total: %v\n",
-				oldAccepteds, oldDups, acceptedTotal)
-			//runtime.ReadMemStats(&m1)
-			//memUsage(&m0, &m1)
+				oldAccepteds, oldDups, newTotal)
 		}
 	}()
 
@@ -160,20 +154,19 @@ func save(token string) {
 		panic(err)
 	}
 
-	exists := false
 	mutex.Lock()
-	_, exists = saveMap[uint32(itoken)]
+	_, exists := saveMap[uint32(itoken)]
 	if !exists {
 		saveMap[uint32(itoken)] = true
 		mutex.Unlock()
 
-		atomic.AddInt64(&accepteds, 1)
+		accepteds.Add(1)
 
 		// and append to file
 		writerQueue <- token
 	} else {
 		mutex.Unlock()
-		atomic.AddInt64(&duplicates, 1)
+		duplicates.Add(1)
 	}
 }
 
