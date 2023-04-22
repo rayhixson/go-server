@@ -8,6 +8,9 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,29 +23,41 @@ const acceptedTokenPattern = `^\d{9}$`
 const fileName = "numbers.log"
 const workerCount = 5
 
-var saveMap sync.Map
-var saveFile *os.File
+// var saveMap sync.Map
+var saveMap map[uint32]bool
+var mutex sync.Mutex
 var accepteds int64
 var acceptedTotal int64
 var duplicates int64
 var waitGroup sync.WaitGroup
 var running = true
+var logger *bufio.Writer
 
 type WorkerFunc func(net.Conn)
 
 var workerQueue = make(chan WorkerFunc, workerCount)
 var writerQueue = make(chan string)
 
+var m0, m1 runtime.MemStats
+
+func memUsage(m1, m2 *runtime.MemStats) {
+	fmt.Println("Alloc:", m2.Alloc-m1.Alloc,
+		"TotalAlloc:", m2.TotalAlloc-m1.TotalAlloc,
+		"HeapAlloc:", m2.HeapAlloc-m1.HeapAlloc)
+}
+
 func main() {
+	runtime.ReadMemStats(&m0)
+	saveMap = make(map[uint32]bool, 100000000)
 	setupExitHandler()
 
-	var err error
-	saveFile, err = os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	saveFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		panic(err)
 	}
-
+	defer saveFile.Close()
 	saveFile.Truncate(0)
+	logger = bufio.NewWriter(log.New(saveFile, "", 0).Writer())
 
 	// start the reporter
 	go func() {
@@ -53,10 +68,12 @@ func main() {
 			atomic.AddInt64(&acceptedTotal, oldAccepteds)
 			fmt.Printf("Received %v unique numbers, %v duplicates. Unique total: %v\n",
 				oldAccepteds, oldDups, acceptedTotal)
+			//runtime.ReadMemStats(&m1)
+			//memUsage(&m0, &m1)
 		}
 	}()
 
-	// do all file writes from one routing
+	// do all file writes from one routine
 	go func() {
 		for {
 			token := <-writerQueue
@@ -64,8 +81,8 @@ func main() {
 			if token == terminateString {
 				break
 			}
-			if _, err := saveFile.Write([]byte(token + "\n")); err != nil {
-				log.Fatalf("Failed to save [%v] -> %v", token, err)
+			if _, err := logger.WriteString(token + "\n"); err != nil {
+				log.Fatalf("Failed to save [%s] -> %v", token, err)
 			}
 		}
 	}()
@@ -133,17 +150,30 @@ func save(token string) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("Recovered in save, token [%v] -> %v", token, r)
+			debug.PrintStack()
+			os.Exit(2)
 		}
 	}()
 
-	_, exists := saveMap.LoadOrStore(token, nil)
-	if exists {
-		atomic.AddInt64(&duplicates, 1)
-	} else {
+	itoken, err := strconv.Atoi(token)
+	if err != nil {
+		panic(err)
+	}
+
+	exists := false
+	mutex.Lock()
+	_, exists = saveMap[uint32(itoken)]
+	if !exists {
+		saveMap[uint32(itoken)] = true
+		mutex.Unlock()
+
 		atomic.AddInt64(&accepteds, 1)
 
 		// and append to file
 		writerQueue <- token
+	} else {
+		mutex.Unlock()
+		atomic.AddInt64(&duplicates, 1)
 	}
 }
 
@@ -162,12 +192,12 @@ func exit() {
 
 	waitGroup.Wait()
 
-	// terminate the writer AFTER the handlers are done reading their last token
+	// terminate the writer AFTER the handlers are done with their last token
 	writerQueue <- terminateString
 
-	saveFile.Close()
 	close(workerQueue)
 	close(writerQueue)
+	logger.Flush()
 
 	os.Exit(1)
 }
