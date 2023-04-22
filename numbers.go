@@ -7,8 +7,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"regexp"
-	"runtime"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -35,13 +33,8 @@ var logger *bufio.Writer
 type WorkerFunc func(net.Conn)
 
 var workerQueue = make(chan WorkerFunc, workerCount)
-var writerQueue = make(chan string)
-
-func memUsage(m1, m2 *runtime.MemStats) {
-	fmt.Println("Alloc:", m2.Alloc-m1.Alloc,
-		"TotalAlloc:", m2.TotalAlloc-m1.TotalAlloc,
-		"HeapAlloc:", m2.HeapAlloc-m1.HeapAlloc)
-}
+var writerQueue = make(chan uint32)
+var terminate = make(chan bool)
 
 func main() {
 	setupExitHandler()
@@ -53,7 +46,7 @@ func main() {
 	}
 	defer saveFile.Close()
 	saveFile.Truncate(0)
-	logger = bufio.NewWriter(log.New(saveFile, "", 0).Writer())
+	logger = bufio.NewWriter(saveFile)
 
 	// start the reporter
 	go func() {
@@ -70,14 +63,15 @@ func main() {
 	// do all file writes from one routine
 	go func() {
 		for {
-			token := <-writerQueue
-			// write until we get the terminate signal
-			if token == terminateString {
+			select {
+			case token := <-writerQueue:
+				if _, err := logger.WriteString(strconv.Itoa(int(token)) + "\n"); err != nil {
+					log.Fatalf("Failed to save [%d] -> %v", token, err)
+				}
+			case <-terminate:
 				break
 			}
-			if _, err := logger.WriteString(token + "\n"); err != nil {
-				log.Fatalf("Failed to save [%s] -> %v", token, err)
-			}
+
 		}
 	}()
 
@@ -112,7 +106,6 @@ func main() {
 func acceptCode(conn net.Conn) {
 	defer waitGroup.Done()
 
-	validRegEx := regexp.MustCompile(acceptedTokenPattern)
 	reader := bufio.NewScanner(conn)
 	for reader.Scan() && running {
 		tok := reader.Text()
@@ -128,8 +121,9 @@ func acceptCode(conn net.Conn) {
 			break
 		}
 
-		if validRegEx.MatchString(tok) {
-			save(tok)
+		itok, err := strconv.Atoi(tok)
+		if err == nil && len(tok) == 9 {
+			save(uint32(itok))
 		} else {
 			fmt.Printf("Rejected not a num: [%v]\n", tok)
 			conn.Close()
@@ -140,7 +134,7 @@ func acceptCode(conn net.Conn) {
 	workerQueue <- acceptCode
 }
 
-func save(token string) {
+func save(token uint32) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("Recovered in save, token [%v] -> %v", token, r)
@@ -149,15 +143,10 @@ func save(token string) {
 		}
 	}()
 
-	itoken, err := strconv.Atoi(token)
-	if err != nil {
-		panic(err)
-	}
-
 	mutex.Lock()
-	_, exists := saveMap[uint32(itoken)]
+	_, exists := saveMap[token]
 	if !exists {
-		saveMap[uint32(itoken)] = true
+		saveMap[token] = true
 		mutex.Unlock()
 
 		accepteds.Add(1)
@@ -186,7 +175,7 @@ func exit() {
 	waitGroup.Wait()
 
 	// terminate the writer AFTER the handlers are done with their last token
-	writerQueue <- terminateString
+	terminate <- true
 
 	close(workerQueue)
 	close(writerQueue)
