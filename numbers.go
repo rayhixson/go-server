@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -28,7 +30,8 @@ var acceptedTotal atomic.Int64
 var duplicates atomic.Int64
 var waitGroup sync.WaitGroup
 var running = true
-var logger *bufio.Writer
+
+var logger WriterFlusher
 
 type WorkerFunc func(net.Conn)
 
@@ -36,7 +39,22 @@ var workerQueue = make(chan WorkerFunc, workerCount)
 var writerQueue = make(chan uint32)
 var terminate = make(chan bool)
 
+type WriterFlusher interface {
+	io.StringWriter
+	Flush() error
+}
+
+type fileLogger struct {
+	io.StringWriter
+}
+
+func (f fileLogger) Flush() error { return nil }
+
 func main() {
+	var useBufferedWriter bool
+	flag.BoolVar(&useBufferedWriter, "b", true, "Use a buffered writer to the file or not")
+	flag.Parse()
+
 	setupExitHandler()
 	saveMap = make(map[uint32]bool, 100000000)
 
@@ -46,7 +64,13 @@ func main() {
 	}
 	defer saveFile.Close()
 	saveFile.Truncate(0)
-	logger = bufio.NewWriter(saveFile)
+	if useBufferedWriter {
+		fmt.Println("Using a buffered writer: better performance with a chance of losing data in a crash")
+		logger = bufio.NewWriter(saveFile)
+	} else {
+		fmt.Println("NOT Using a buffered writer: lower performance with better data preservation in a crash")
+		logger = fileLogger{saveFile}
+	}
 
 	// start the reporter
 	go func() {
