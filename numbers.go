@@ -7,7 +7,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"regexp"
+	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,53 +21,57 @@ const acceptedTokenPattern = `^\d{9}$`
 const fileName = "numbers.log"
 const workerCount = 5
 
-var saveMap sync.Map
-var saveFile *os.File
-var accepteds int64
-var acceptedTotal int64
-var duplicates int64
+var saveMap map[uint32]bool
+var mutex sync.Mutex
+var accepteds atomic.Int64
+var acceptedTotal atomic.Int64
+var duplicates atomic.Int64
 var waitGroup sync.WaitGroup
 var running = true
+var logger *bufio.Writer
 
 type WorkerFunc func(net.Conn)
 
 var workerQueue = make(chan WorkerFunc, workerCount)
-var writerQueue = make(chan string)
+var writerQueue = make(chan uint32)
+var terminate = make(chan bool)
 
 func main() {
 	setupExitHandler()
+	saveMap = make(map[uint32]bool, 100000000)
 
-	var err error
-	saveFile, err = os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	saveFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		panic(err)
 	}
-
+	defer saveFile.Close()
 	saveFile.Truncate(0)
+	logger = bufio.NewWriter(saveFile)
 
 	// start the reporter
 	go func() {
 		for {
 			time.Sleep(10 * time.Second)
-			oldDups := atomic.SwapInt64(&duplicates, 0)
-			oldAccepteds := atomic.SwapInt64(&accepteds, 0)
-			atomic.AddInt64(&acceptedTotal, oldAccepteds)
+			oldDups := duplicates.Swap(0)
+			oldAccepteds := accepteds.Swap(0)
+			newTotal := acceptedTotal.Add(oldAccepteds)
 			fmt.Printf("Received %v unique numbers, %v duplicates. Unique total: %v\n",
-				oldAccepteds, oldDups, acceptedTotal)
+				oldAccepteds, oldDups, newTotal)
 		}
 	}()
 
-	// do all file writes from one routing
+	// do all file writes from one routine
 	go func() {
 		for {
-			token := <-writerQueue
-			// write until we get the terminate signal
-			if token == terminateString {
+			select {
+			case token := <-writerQueue:
+				if _, err := logger.WriteString(strconv.Itoa(int(token)) + "\n"); err != nil {
+					log.Fatalf("Failed to save [%d] -> %v", token, err)
+				}
+			case <-terminate:
 				break
 			}
-			if _, err := saveFile.Write([]byte(token + "\n")); err != nil {
-				log.Fatalf("Failed to save [%v] -> %v", token, err)
-			}
+
 		}
 	}()
 
@@ -101,7 +106,6 @@ func main() {
 func acceptCode(conn net.Conn) {
 	defer waitGroup.Done()
 
-	validRegEx := regexp.MustCompile(acceptedTokenPattern)
 	reader := bufio.NewScanner(conn)
 	for reader.Scan() && running {
 		tok := reader.Text()
@@ -117,8 +121,9 @@ func acceptCode(conn net.Conn) {
 			break
 		}
 
-		if validRegEx.MatchString(tok) {
-			save(tok)
+		itok, err := strconv.Atoi(tok)
+		if err == nil && len(tok) == 9 {
+			save(uint32(itok))
 		} else {
 			fmt.Printf("Rejected not a num: [%v]\n", tok)
 			conn.Close()
@@ -129,21 +134,28 @@ func acceptCode(conn net.Conn) {
 	workerQueue <- acceptCode
 }
 
-func save(token string) {
+func save(token uint32) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("Recovered in save, token [%v] -> %v", token, r)
+			debug.PrintStack()
+			os.Exit(2)
 		}
 	}()
 
-	_, exists := saveMap.LoadOrStore(token, nil)
-	if exists {
-		atomic.AddInt64(&duplicates, 1)
-	} else {
-		atomic.AddInt64(&accepteds, 1)
+	mutex.Lock()
+	_, exists := saveMap[token]
+	if !exists {
+		saveMap[token] = true
+		mutex.Unlock()
+
+		accepteds.Add(1)
 
 		// and append to file
 		writerQueue <- token
+	} else {
+		mutex.Unlock()
+		duplicates.Add(1)
 	}
 }
 
@@ -162,12 +174,12 @@ func exit() {
 
 	waitGroup.Wait()
 
-	// terminate the writer AFTER the handlers are done reading their last token
-	writerQueue <- terminateString
+	// terminate the writer AFTER the handlers are done with their last token
+	terminate <- true
 
-	saveFile.Close()
 	close(workerQueue)
 	close(writerQueue)
+	logger.Flush()
 
 	os.Exit(1)
 }
